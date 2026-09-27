@@ -1,0 +1,41 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # ogni 6 ore
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream
+        run: git remote add upstream https://github.com/stremio-manager/EasyProxy.git || true
+
+      - name: Fetch upstream
+        run: git fetch upstream
+
+      - name: Sync with upstream
+        run: |
+          set -e
+          if git diff --quiet HEAD upstream/main; then
+            echo "Already aligned with upstream"
+            exit 0
+          fi
+
+          git merge -X theirs upstream/main --no-edit
+          git push origin main
