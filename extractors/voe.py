@@ -1,4 +1,5 @@
 import base64
+import codecs
 import json
 import logging
 import re
@@ -27,14 +28,7 @@ class VoeExtractor(BaseExtractor):
     def _build_result(self, final_url: str, referer_url: str) -> dict:
         headers = dict(self.base_headers)
         headers["referer"] = referer_url
-        return {
-            "destination_url": final_url,
-            "request_headers": headers,
-            "mediaflow_endpoint": "hls_proxy",
-            "selected_proxy": self.last_used_proxy,
-            "force_direct": self._force_direct,
-            "bypass_warp": self.bypass_warp_active,
-        }
+        return self._result(final_url, headers, mediaflow_endpoint="hls_proxy")
 
     async def _try_extract_from_texts(self, url: str, texts: list[str]) -> dict | None:
         for combined_text in texts:
@@ -149,16 +143,7 @@ class VoeExtractor(BaseExtractor):
 
     @staticmethod
     def _rot13(text: str) -> str:
-        out = []
-        for ch in text:
-            o = ord(ch)
-            if 65 <= o <= 90:
-                out.append(chr(((o - 65 + 13) % 26) + 65))
-            elif 97 <= o <= 122:
-                out.append(chr(((o - 97 + 13) % 26) + 97))
-            else:
-                out.append(ch)
-        return ''.join(out)
+        return codecs.decode(text, "rot_13")
 
     @staticmethod
     def _safe_b64_decode(s: str) -> str:
@@ -241,5 +226,3 @@ class VoeExtractor(BaseExtractor):
         txt = base64.b64decode(txt[::-1]).decode('utf-8')
         return json.loads(txt)
 
-    async def close(self):
-        await super().close()

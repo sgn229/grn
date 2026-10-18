@@ -13,7 +13,6 @@ import base64
 import hashlib
 import socket
 import config as _config
-import config_store
 import services.wg_tunnels as wg_tunnels
 from services.session_lifetime import retire_session
 from services.socks_bridge import close_socks_bridges
@@ -21,8 +20,6 @@ from services.socks_bridge import close_socks_bridges
 import services.proxy_shared as _shared
 from services.proxy_shared import (
     logger,
-    SELECTED_PROXY_CONTEXT,
-    STRICT_PROXY_CONTEXT,
     get_proxy_for_url,
     get_connector_for_proxy,
     get_extractor_proxies,
@@ -41,7 +38,7 @@ from services.proxy_shared import (
 # /bin/sh (git checkouts do not carry the executable bit).
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WARP_CTL_SCRIPT = os.environ.get("WARP_CTL_SCRIPT") or os.path.join(
-    _PROJECT_DIR, "scripts", "warp_userspace_ctl.sh"
+    _PROJECT_DIR, "scripts", "wireproxy_ctl.sh"
 )
 
 
@@ -1293,7 +1290,6 @@ class HLSProxyCoreMixin:
             bypass_warp=bypass_warp,
         )
         if result:
-            key = getattr(result, '_cache_key', None) or id(result)
             for ek, ev in self.extractors.items():
                 if ev is result:
                     self._extractor_atimes[ek] = time.time()

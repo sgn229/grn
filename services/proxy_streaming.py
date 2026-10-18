@@ -6,9 +6,8 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 from services.dual.video import byte_range, video_only
-import config_store
 import config as _config
-from config import PROXY_SOURCE_LIST, find_first_alive_async, is_proxy_alive
+from config import is_proxy_alive
 import services.proxy_shared as _shared
 import services.wg_tunnels as wg_tunnels
 from services.proxy_shared import (
@@ -30,6 +29,7 @@ from services.proxy_shared import (
     ManifestRewriter,
     MPDToHLSConverter,
     parse_clearkey_params,
+    ProxyDeadRetryError,
     seal_clearkey,
     decrypt_segment,
     check_password,
@@ -37,7 +37,6 @@ from services.proxy_shared import (
     final_curl_request_url,
     should_use_curl_cffi,
     is_special_cdn_stream,
-    ProxyDeadRetryError,
     get_public_base_url,
     get_extractor_routing_overrides,
     request_log_context,
@@ -1706,7 +1705,6 @@ class HLSProxyStreamingMixin:
                             pass
 
                     # --- DEFAULT: DASH Proxy (Rewriting) ---
-                    req_format = request.query.get("format")
                     rep_id = request.query.get("rep_id")
 
                     api_password = request.query.get("api_password")
@@ -2065,7 +2063,6 @@ class HLSProxyStreamingMixin:
     ):
         """Re-extract the source on 403 to refresh signed CDN tokens, then retry the segment."""
         import urllib.parse as _up
-        from services.proxy_shared import ProxyDeadRetryError
 
         orig_url = request.query.get("orig_url")
         if not orig_url:

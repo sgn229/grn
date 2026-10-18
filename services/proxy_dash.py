@@ -1,5 +1,4 @@
 import re
-import time
 import aiohttp
 from urllib.parse import urljoin, urlparse, unquote
 from config import STRICT_PROXY_CONTEXT, resolve_proxy_alias
@@ -10,7 +9,6 @@ from services.proxy_shared import (
     check_password,
     get_ssl_setting_for_url,
     get_proxy_for_url,
-    mark_proxy_dead,
     decrypt_segment,
     is_browser_key_request,
     fetch_browser_backed_key,
@@ -454,7 +452,7 @@ class HLSProxyDashMixin:
             # Caso 'auth' - URL che contengono 'auth' richiedono headers speciali
             if "auth" in key_url.lower():
                 logger.debug(
-                    f"🔐 Detected 'auth' key URL, ensuring special headers are present"
+                    "🔐 Detected 'auth' key URL, ensuring special headers are present"
                 )
                 if "X-User-Agent" not in headers:
                     headers["X-User-Agent"] = headers.get(
