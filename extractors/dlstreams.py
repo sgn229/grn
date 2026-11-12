@@ -159,6 +159,17 @@ def invalidate_premium_playlist_token(playlist_url: str, route_key: str = "") ->
         _premium_tokens.pop(key, None)
 
 
+def _manual_ticket(slug: str) -> str:
+    """Page ticket pasted from a real browser (routes/dlstreams_ticket.py)."""
+    try:
+        import config_store
+
+        tickets = config_store.get("dlstreams_manual_tickets", {}) or {}
+    except Exception:
+        return ""
+    return str(tickets.get(slug) or tickets.get("*") or "").strip()
+
+
 async def premium_playlist_token(
     session, playlist_url: str, headers: dict = None, force: bool = False,
     route_key: str = "",
@@ -189,18 +200,35 @@ async def premium_playlist_token(
             or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
             "Accept": "*/*",
         }
-        try:
+        manual = _manual_ticket(slug)
+
+        async def _fetch(use_manual: bool):
+            params = {"slug": slug}
+            if use_manual and manual:
+                params["tk"] = manual
             async with session.get(
-                f"{edge}{PREMIUM_TOKEN_PATH}?slug={slug}",
+                f"{edge}{PREMIUM_TOKEN_PATH}?{urllib.parse.urlencode(params)}",
                 headers=token_headers,
                 timeout=ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
-                    logger.debug(
-                        "DLStreams: premium token for %s -> HTTP %s", slug, resp.status
-                    )
-                    return cached[0] if cached else None
-                data = await resp.json(content_type=None)
+                    return resp.status, None
+                return resp.status, await resp.json(content_type=None)
+
+        try:
+            status, data = await _fetch(bool(manual))
+            if status != 200 and manual:
+                logger.warning(
+                    "DLStreams: manual ticket for %s rejected (HTTP %s); retrying without it",
+                    slug,
+                    status,
+                )
+                status, data = await _fetch(False)
+            if status != 200:
+                logger.debug(
+                    "DLStreams: premium token for %s -> HTTP %s", slug, status
+                )
+                return cached[0] if cached else None
         except Exception as exc:
             logger.debug("DLStreams: premium token for %s failed: %s", slug, exc)
             return cached[0] if cached else None

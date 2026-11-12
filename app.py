@@ -22,6 +22,7 @@ from services.recording_manager import RecordingManager
 from routes.recordings import setup_recording_routes
 from routes.wg_tunnels import setup_wg_tunnel_routes
 from routes.tor_proxy import setup_tor_proxy_routes
+from routes.dlstreams_ticket import setup_dlstreams_ticket_routes
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +155,8 @@ def create_app():
     setup_wg_tunnel_routes(app)
     # Tor SOCKS5 tunnel + admin panel
     setup_tor_proxy_routes(app)
+    # Manual DLStreams premium page ticket entry
+    setup_dlstreams_ticket_routes(app)
     
     # Gestore OPTIONS generico per CORS
     app.router.add_route('OPTIONS', '/{tail:.*}', proxy.handle_options)
