@@ -57,6 +57,8 @@ DEFAULT_CONFIG = {
     # Preferred exit country; the app picks a relay there and pins its fingerprint.
     "tor_exit_country": "",
     "extractor_proxies": {},
+    # Manual premium page tickets, slug -> ticket. See routes/dlstreams_ticket.py.
+    "dlstreams_manual_tickets": {},
     # Cinejoy's gateway rejects Cloudflare WARP egress (HTTP 403). Keep its
     # resolver direct unless the user explicitly supplies another proxy route.
     "warp_off_extractors": ["cinejoy"],
