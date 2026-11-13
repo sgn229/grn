@@ -61,7 +61,7 @@ DEFAULT_CONFIG = {
     "dlstreams_manual_tickets": {},
     # Cinejoy's gateway rejects Cloudflare WARP egress (HTTP 403). Keep its
     # resolver direct unless the user explicitly supplies another proxy route.
-    "warp_off_extractors": ["cinejoy"],
+    "warp_off_extractors": ["cinejoy", "dlstreams"],
     "proxy_off_extractors": [],
     "proxy_exclude_domains": [],
     # Force the highest video variant (no adaptive bitrate). Can be enabled per
