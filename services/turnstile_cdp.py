@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import base64
+import email.utils
 import json
 import logging
 import os
@@ -50,6 +51,16 @@ def _build_user_agent(chrome_path: str) -> str:
                 break
     except OSError:
         pass
+    if os.name != "nt":
+        try:
+            proc = subprocess.run(
+                [chrome_path, "--version"], capture_output=True, text=True, timeout=5
+            )
+            match = re.search(r"(\d+\.\d+\.\d+\.\d+)", proc.stdout or "")
+            if match:
+                version = match.group(1)
+        except Exception:
+            pass
     if os.name == "nt":
         platform = "Windows NT 10.0; Win64; x64"
     elif sys.platform == "darwin":
@@ -80,7 +91,9 @@ JSON.stringify({
   box: !!document.querySelector('#turnstile-container'),
   tok: (document.querySelector("input[name='cf-turnstile-response']") || {}).value ? 'set' : null,
   ecfg: typeof window._econfig,
-  len: window._econfig ? String(window._econfig).length : 0
+  len: window._econfig ? String(window._econfig).length : 0,
+  body: document.body ? String(document.body.innerText || '').slice(0, 200) : null,
+  ua: navigator.userAgent
 })
 """
 # The "trusted browser" variant of the player ships the signed URL in the page
@@ -103,6 +116,11 @@ _READ_ECONFIG = """
   } catch (e) { return null; }
 })()
 """
+
+
+def _is_stale_session(exc: Exception) -> bool:
+    """True when a CDP call targets a detached iframe session."""
+    return "session with given id not found" in str(exc).lower()
 
 
 def find_chrome() -> str | None:
@@ -263,26 +281,46 @@ async def solve_player_stream(
 ) -> dict | None:
     """Load ``page_url``, solve the player Turnstile gate, return the POST body."""
     try:
-        return await _solve(page_url, proxy, timeout)
+        return await _solve(page_url, proxy, timeout, mode="stream")
     except Exception as e:
         logger.warning("Turnstile solver: failed for %s: %r", page_url, e)
         return None
 
 
-async def _solve(page_url: str, proxy: str | None, timeout: float) -> dict | None:
+async def solve_premium_ticket(
+    page_url: str, proxy: str | None = None, timeout: float = 45.0
+) -> dict | None:
+    """Solve the premium player Turnstile and return its playlist ticket.
+
+    After the challenge the player POSTs to ``/premiumtv/daddy.php?id=<id>`` and
+    gets ``{"ticket": "<epoch>.<ip>.<hmac>"}``; the edge token endpoint only
+    answers for the address that holds the ticket.
+    """
+    try:
+        return await _solve(page_url, proxy, timeout, mode="premium")
+    except Exception as e:
+        logger.warning("Turnstile solver: premium failed for %s: %r", page_url, e)
+        return None
+
+
+async def _solve(
+    page_url: str, proxy: str | None, timeout: float, mode: str = "stream"
+) -> dict | None:
     async with _SOLVE_LOCK:
         for attempt in (1, 2):
-            solution = await _solve_once(page_url, proxy, min(timeout, 30.0))
+            solution = await _solve_once(page_url, proxy, min(timeout, 30.0), mode)
             if solution:
                 return solution
             logger.info(
-                "Turnstile solver: attempt %d/2 did not capture the stream URL", attempt
+                "Turnstile solver: attempt %d/2 did not capture %s",
+                attempt,
+                "the premium ticket" if mode == "premium" else "the stream URL",
             )
         return None
 
 
 async def _solve_once(
-    page_url: str, proxy: str | None, timeout: float
+    page_url: str, proxy: str | None, timeout: float, mode: str = "stream"
 ) -> dict | None:
     chrome = find_chrome()
     if not chrome:
@@ -309,7 +347,8 @@ async def _solve_once(
     ua = _build_user_agent(chrome)
     cmd = [chrome]
     if headless:
-        cmd.append("--headless=new")
+        # Headless advertises HeadlessChrome: keep the client hint set coherent.
+        cmd.extend(["--headless=new", f"--user-agent={ua}"])
     else:
         # A real window passes Turnstile far more often than headless. Hide it
         # off-screen on Windows only: Xvfb is already invisible, and an
@@ -331,7 +370,6 @@ async def _solve_once(
         "--disable-blink-features=AutomationControlled",
         "--disable-extensions",
         "--disable-component-extensions-with-background-pages",
-        f"--user-agent={ua}",
     ])
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         cmd.append("--no-sandbox")
@@ -355,12 +393,17 @@ async def _solve_once(
             return None
 
         version = await asyncio.to_thread(_read_devtools_version, port)
+        logger.info(
+            "Turnstile solver: browser %s, UA %s",
+            version.get("Browser"),
+            ua,
+        )
 
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(
                 version["webSocketDebuggerUrl"], max_msg_size=0
             ) as ws:
-                return await _drive(ws, page_url, timeout, ua)
+                return await _drive(ws, page_url, timeout, ua, mode)
     finally:
         try:
             proc.terminate()
@@ -393,7 +436,27 @@ def _read_devtools_version(port: int) -> dict:
         return json.load(response)
 
 
-async def _drive(ws, page_url: str, timeout: float, ua: str) -> dict | None:
+async def _response_json(cdp, request_id, session_id) -> dict | None:
+    """JSON body of a response; it can be briefly unavailable right after the event."""
+    for attempt in range(3):
+        try:
+            body = await cdp.send(
+                "Network.getResponseBody", {"requestId": request_id}, session_id
+            )
+            data = json.loads(body.get("body") or "")
+        except Exception as e:
+            logger.debug("Turnstile solver: body read failed: %r", e)
+            data = None
+        if isinstance(data, dict):
+            return data
+        if attempt < 2:
+            await asyncio.sleep(0.2)
+    return None
+
+
+async def _drive(
+    ws, page_url: str, timeout: float, ua: str, mode: str = "stream"
+) -> dict | None:
     cdp = _CDP(ws)
     try:
         target = await cdp.send("Target.createTarget", {"url": "about:blank"})
@@ -405,6 +468,10 @@ async def _drive(ws, page_url: str, timeout: float, ua: str) -> dict | None:
         await cdp.send("Page.enable", {}, sid)
         # Same-origin players are not OOPIFs: their POST would surface here.
         await cdp.send("Network.enable", {}, sid)
+        try:
+            await cdp.send("Log.enable", {}, sid)
+        except Exception as e:
+            logger.debug("Turnstile solver: Log.enable failed: %r", e)
         try:
             await cdp.send(
                 "Emulation.setFocusEmulationEnabled", {"enabled": True}, sid
@@ -422,6 +489,10 @@ async def _drive(ws, page_url: str, timeout: float, ua: str) -> dict | None:
         iframe_sid = None
         clicks = 0
         next_probe = time.monotonic() + 3
+        actual_ua = None
+        server_date = None
+        challenge_urls: dict[str, str] = {}
+        captured: dict = {}
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
             try:
@@ -433,7 +504,11 @@ async def _drive(ws, page_url: str, timeout: float, ua: str) -> dict | None:
                 params = ev.get("params", {})
                 esid = ev.get("sessionId")
 
-                if method == "Target.attachedToTarget":
+                if method == "Network.requestWillBeSent":
+                    url = params.get("request", {}).get("url", "")
+                    if "challeng" in url or "turnstile" in url:
+                        challenge_urls[params.get("requestId")] = url
+                elif method == "Target.attachedToTarget":
                     info = params.get("targetInfo", {})
                     new_sid = params.get("sessionId")
                     if not new_sid:
@@ -442,7 +517,7 @@ async def _drive(ws, page_url: str, timeout: float, ua: str) -> dict | None:
                         iframe_sid = new_sid if info.get("type") == "iframe" else iframe_sid
                         # Runtime.enable is a known CDP detection vector; evaluate
                         # works without it.
-                        for domain in ("Network.enable", "Page.enable"):
+                        for domain in ("Network.enable", "Page.enable", "Log.enable"):
                             try:
                                 await cdp.send(domain, {}, new_sid)
                             except Exception as e:
@@ -455,6 +530,43 @@ async def _drive(ws, page_url: str, timeout: float, ua: str) -> dict | None:
                             logger.debug("Turnstile solver: focus emulation failed: %r", e)
                 elif method == "Network.responseReceived":
                     url = params.get("response", {}).get("url", "")
+                    if esid == sid and server_date is None:
+                        headers = params.get("response", {}).get("headers", {}) or {}
+                        for key, value in headers.items():
+                            if key.lower() == "date":
+                                server_date = str(value)
+                                break
+                    if mode == "premium":
+                        # Ticket POST first, then the token GET that consumes it.
+                        # Only the JSON APIs: a document body is not JSON.
+                        wanted = None
+                        if params.get("type") in ("XHR", "Fetch"):
+                            if "premiumtv/daddy.php" in url:
+                                wanted = "ticket"
+                            elif "/api/playlist-token" in url:
+                                wanted = "token"
+                        if wanted:
+                            data = await _response_json(cdp, params.get("requestId"), esid)
+                            if wanted == "ticket" and (data or {}).get("ticket"):
+                                captured["ticket"] = str(data["ticket"])
+                                logger.info("Turnstile solver: premium ticket captured")
+                            elif wanted == "token" and (data or {}).get("token"):
+                                captured["token"] = str(data["token"])
+                                captured["k"] = data.get("k")
+                                captured["ttl"] = data.get("ttl")
+                                logger.info(
+                                    "Turnstile solver: premium playlist token captured"
+                                )
+                            if captured.get("ticket") and captured.get("token"):
+                                return {
+                                    "success": True,
+                                    "ticket": captured.get("ticket"),
+                                    "token": captured.get("token"),
+                                    "k": captured.get("k"),
+                                    "ttl": captured.get("ttl"),
+                                    "_solver_user_agent": actual_ua or ua,
+                                }
+                        continue
                     if "/turnstile/" not in url or "challenges.cloudflare.com" in url:
                         continue
                     try:
@@ -467,26 +579,59 @@ async def _drive(ws, page_url: str, timeout: float, ua: str) -> dict | None:
                     except Exception as e:
                         logger.debug("Turnstile solver: body read failed: %r", e)
                         continue
-                    solution["_solver_user_agent"] = ua
+                    solution["_solver_user_agent"] = actual_ua or ua
                     logger.info(
                         "Turnstile solver: stream URL captured for %s", page_url
                     )
                     return solution
+                elif method == "Network.loadingFailed":
+                    failed_url = challenge_urls.get(params.get("requestId"))
+                    if failed_url:
+                        logger.debug(
+                            "Turnstile solver: challenge request failed: %s -> %s",
+                            failed_url,
+                            params.get("errorText"),
+                        )
+                elif method == "Log.entryAdded":
+                    entry = params.get("entry", {})
+                    logger.debug(
+                        "Turnstile solver: console %s: %s",
+                        entry.get("level"),
+                        entry.get("text"),
+                    )
 
             if iframe_sid and time.monotonic() >= next_probe:
                 next_probe = time.monotonic() + 3
+                # The UA the browser actually reports beats the declared one.
+                if actual_ua is None:
+                    try:
+                        res_ua = await cdp.send(
+                            "Runtime.evaluate",
+                            {"expression": "navigator.userAgent", "returnByValue": True},
+                            iframe_sid,
+                        )
+                        actual_ua = (res_ua.get("result", {}) or {}).get("value") or None
+                    except Exception as e:
+                        if _is_stale_session(e):
+                            iframe_sid = None
+                        logger.debug("Turnstile solver: UA probe failed: %r", e)
                 # Non-gated variant: the config already carries the signed URL.
-                try:
-                    plain = await cdp.send(
-                        "Runtime.evaluate",
-                        {"expression": _READ_ECONFIG, "returnByValue": True},
-                        iframe_sid,
-                    )
-                    encoded = plain.get("result", {}).get("value")
-                except Exception as e:
-                    logger.debug("Turnstile solver: _econfig read failed: %r", e)
-                    encoded = None
-                if isinstance(encoded, str) and encoded:
+                # The premium player has no _econfig: its URL comes from the token.
+                encoded = None
+                if iframe_sid:
+                    try:
+                        plain = await cdp.send(
+                            "Runtime.evaluate",
+                            {"expression": _READ_ECONFIG, "returnByValue": True},
+                            iframe_sid,
+                        )
+                        encoded = plain.get("result", {}).get("value")
+                    except Exception as e:
+                        if _is_stale_session(e):
+                            iframe_sid = None
+                        logger.debug("Turnstile solver: _econfig read failed: %r", e)
+                        encoded = None
+                if mode == "stream" and isinstance(encoded, str) and encoded:
                     try:
                         config = json.loads(
                             base64.b64decode(
@@ -506,10 +651,10 @@ async def _drive(ws, page_url: str, timeout: float, ua: str) -> dict | None:
                             "success": True,
                             "stream_url": config.get("stream_url"),
                             "stream_url_nop2p": config.get("stream_url_nop2p"),
-                            "_solver_user_agent": ua,
+                            "_solver_user_agent": actual_ua or ua,
                         }
                         return solution
-                if clicks < 4:
+                if iframe_sid and clicks < 4:
                     try:
                         probe = await cdp.send(
                             "Runtime.evaluate",
@@ -518,6 +663,8 @@ async def _drive(ws, page_url: str, timeout: float, ua: str) -> dict | None:
                         )
                         raw = probe.get("result", {}).get("value")
                     except Exception as e:
+                        if _is_stale_session(e):
+                            iframe_sid = None
                         logger.debug("Turnstile solver: widget probe failed: %r", e)
                         raw = None
                     if raw:
@@ -542,6 +689,20 @@ async def _drive(ws, page_url: str, timeout: float, ua: str) -> dict | None:
                             "Turnstile solver: clicked widget (%d/4)", clicks
                         )
 
+        if mode == "premium" and captured.get("ticket"):
+            # The ticket alone is enough for the caller's own token GET.
+            logger.warning(
+                "Turnstile solver: premium ticket captured, no playlist token within %.0fs",
+                timeout,
+            )
+            return {
+                "success": True,
+                "ticket": captured.get("ticket"),
+                "token": None,
+                "k": None,
+                "ttl": None,
+                "_solver_user_agent": actual_ua or ua,
+            }
         try:
             diag = await cdp.send(
                 "Runtime.evaluate",
@@ -554,8 +715,29 @@ async def _drive(ws, page_url: str, timeout: float, ua: str) -> dict | None:
             )
         except Exception as e:
             logger.debug("Turnstile solver: timeout diagnostics failed: %r", e)
+        if server_date:
+            # Positive = the browser clock runs ahead of the origin.
+            try:
+                probe = await cdp.send(
+                    "Runtime.evaluate",
+                    {"expression": "Date.now()", "returnByValue": True},
+                    iframe_sid or sid,
+                )
+                now_ms = (probe.get("result", {}) or {}).get("value")
+                server_ms = (
+                    email.utils.parsedate_to_datetime(server_date).timestamp() * 1000
+                )
+                skew = (now_ms - server_ms) / 1000
+                if abs(skew) > 120:
+                    logger.warning("Turnstile solver: clock skew %.0fs (fix NTP)", skew)
+                else:
+                    logger.debug("Turnstile solver: clock skew %.0fs", skew)
+            except Exception as e:
+                logger.debug("Turnstile solver: clock skew check failed: %r", e)
         logger.warning(
-            "Turnstile solver: no /turnstile/ response within %.0fs", timeout
+            "Turnstile solver: no %s within %.0fs",
+            "premium response" if mode == "premium" else "/turnstile/ response",
+            timeout,
         )
         return None
     finally:
