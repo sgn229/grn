@@ -1046,6 +1046,16 @@ class HLSProxyStreamingMixin:
             forced_proxy, bypass_warp
         )
         request._ps_forced_proxy = forced_proxy
+
+        # A local bridge must never ride a proxy/WARP tunnel: the far end would
+        # try to reach the other machine's loopback.
+        if (urllib.parse.urlparse(str(stream_url)).hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}:
+            logger.debug("loopback target: forcing direct route")
+            bypass_warp = True
+            bypass_proxies = True
+            force_direct = True
+            forced_proxy = None
+            request._ps_forced_proxy = None
         session = None
         session_proxy = None
 
@@ -1664,11 +1674,13 @@ class HLSProxyStreamingMixin:
                                 status=retry_result["status"],
                                 headers=retry_headers,
                             )
-                    if resp.status == 403 and ("manifest.m3u8" in request.path or "playlist" in request.path):
+                    if resp.status in (403, 404) and ("manifest.m3u8" in request.path or "playlist" in request.path):
+                        # Expired signed manifest tokens (tim-streams, streamfree
+                        # etc.) come back as 404 too, not only 403.
                         # Premium playlist tokens are short-lived and IP-bound:
                         # drop the cached one and retry once with a fresh token
                         # before paying for a full re-extraction.
-                        if is_premium_manifest and not getattr(request, "_premium_token_retried", False):
+                        if resp.status == 403 and is_premium_manifest and not getattr(request, "_premium_token_retried", False):
                             request._premium_token_retried = True
                             invalidate_premium_playlist_token(stream_url, premium_route_key)
                             fresh_url = await ensure_premium_playlist_url(

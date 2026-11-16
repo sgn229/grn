@@ -26,6 +26,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -122,9 +123,49 @@ _READ_ECONFIG = """
 """
 
 
+# Player already live with no gate: no POST /turnstile/ ever arrives, the URL is
+# in the DOM, in the player object or already in the resource timing.
+_READ_STREAM_URL = """
+(() => {
+  try {
+    const v = document.querySelector('video');
+    const cands = [];
+    if (v) { cands.push(v.currentSrc, v.src); }
+    const pick = (obj) => {
+      if (!obj) return;
+      const opts = obj.options || obj.config || {};
+      cands.push(opts.source, opts.file, opts.src, obj.src);
+    };
+    pick(window.player); pick(window.clapprPlayer); pick(window.jwplayer); pick(window.__player);
+    const entries = performance.getEntriesByType('resource') || [];
+    for (const e of entries) if (/\\.m3u8(\\?|$)/i.test(e.name)) cands.push(e.name);
+    const hit = cands.find(u => typeof u === 'string' && /^https?:/.test(u) && /\\.m3u8(\\?|$)/i.test(u));
+    return hit || null;
+  } catch (e) { return null; }
+})()
+"""
+
+
 def _is_stale_session(exc: Exception) -> bool:
     """True when a CDP call targets a detached iframe session."""
     return "session with given id not found" in str(exc).lower()
+
+
+def _host_of(url: str) -> str:
+    return (urlparse(url or "").hostname or "").lower()
+
+
+def _is_player_target(info: dict, host: str) -> bool:
+    """True when a child target is the player iframe of ``host``.
+
+    Loading the player URL directly makes Chrome send ``Sec-Fetch-Site: none``
+    and the player bounces to xstream.to: the parent page must open it as a
+    cross-site OOPIF instead, and that is the target to drive.
+    """
+    if not host or info.get("type") != "iframe":
+        return False
+    target_host = _host_of(info.get("url") or "")
+    return bool(target_host) and target_host == host
 
 
 def find_chrome() -> str | None:
@@ -151,14 +192,39 @@ def find_chrome() -> str | None:
             candidates.append(
                 str(base / "flaresolverr-linux" / "_internal" / "chrome" / name)
             )
+    if os.name == "nt":
+        # Per-user install is the default for accounts without admin rights.
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        if local_app:
+            for rel in (
+                r"Google\Chrome\Application\chrome.exe",
+                r"Chromium\Application\chrome.exe",
+                r"Microsoft\Edge\Application\msedge.exe",
+                r"BraveSoftware\Brave-Browser\Application\brave.exe",
+            ):
+                candidates.append(os.path.join(local_app, rel))
     candidates.extend(
         (
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
             r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"C:\Program Files\Chromium\Application\chrome.exe",
         )
     )
+    if os.name != "nt":
+        # PATH can be minimal in containers: probe the usual install paths too.
+        candidates.extend(
+            (
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/snap/bin/chromium",
+                "/opt/google/chrome/chrome",
+            )
+        )
     candidates.extend(
         str(path)
         for name in ("chrome", "chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "msedge", "microsoft-edge")
@@ -175,6 +241,7 @@ def find_chrome() -> str | None:
         if os.name != "nt" and not os.access(candidate, os.X_OK):
             continue
         return candidate
+    logger.warning("Chrome not found. Tried: %s", ", ".join(candidates[:10]))
     return None
 
 
@@ -288,18 +355,28 @@ class _CDP:
 
 
 async def solve_player_stream(
-    page_url: str, proxy: str | None = None, timeout: float = 45.0
+    page_url: str,
+    proxy: str | None = None,
+    timeout: float = 45.0,
+    parent_url: str | None = None,
 ) -> dict | None:
-    """Load ``page_url``, solve the player Turnstile gate, return the POST body."""
+    """Load the player page, solve its Turnstile gate, return the POST body.
+
+    ``parent_url`` is the page that embeds ``page_url`` as an iframe: passing it
+    lets the iframe load with the Referer/Sec-Fetch-Site it expects.
+    """
     try:
-        return await _solve(page_url, proxy, timeout, mode="stream")
+        return await _solve(page_url, proxy, timeout, mode="stream", parent_url=parent_url)
     except Exception as e:
         logger.warning("Turnstile solver: failed for %s: %r", page_url, e)
         return None
 
 
 async def solve_premium_ticket(
-    page_url: str, proxy: str | None = None, timeout: float = 45.0
+    page_url: str,
+    proxy: str | None = None,
+    timeout: float = 45.0,
+    parent_url: str | None = None,
 ) -> dict | None:
     """Solve the premium player Turnstile and return its playlist ticket.
 
@@ -308,18 +385,26 @@ async def solve_premium_ticket(
     answers for the address that holds the ticket.
     """
     try:
-        return await _solve(page_url, proxy, timeout, mode="premium")
+        return await _solve(
+            page_url, proxy, timeout, mode="premium", parent_url=parent_url
+        )
     except Exception as e:
         logger.warning("Turnstile solver: premium failed for %s: %r", page_url, e)
         return None
 
 
 async def _solve(
-    page_url: str, proxy: str | None, timeout: float, mode: str = "stream"
+    page_url: str,
+    proxy: str | None,
+    timeout: float,
+    mode: str = "stream",
+    parent_url: str | None = None,
 ) -> dict | None:
     async with _SOLVE_LOCK:
         for attempt in (1, 2):
-            solution = await _solve_once(page_url, proxy, min(timeout, 30.0), mode)
+            solution = await _solve_once(
+                page_url, proxy, min(timeout, 30.0), mode, parent_url
+            )
             if solution:
                 return solution
             logger.info(
@@ -438,7 +523,11 @@ async def launch_browser(
 
 
 async def _solve_once(
-    page_url: str, proxy: str | None, timeout: float, mode: str = "stream"
+    page_url: str,
+    proxy: str | None,
+    timeout: float,
+    mode: str = "stream",
+    parent_url: str | None = None,
 ) -> dict | None:
     launched = await launch_browser(proxy=proxy)
     if not launched:
@@ -449,7 +538,7 @@ async def _solve_once(
             async with session.ws_connect(
                 version["webSocketDebuggerUrl"], max_msg_size=0
             ) as ws:
-                return await _drive(ws, page_url, timeout, ua, mode)
+                return await _drive(ws, page_url, timeout, ua, mode, parent_url)
     finally:
         try:
             proc.terminate()
@@ -501,8 +590,19 @@ async def _response_json(cdp, request_id, session_id) -> dict | None:
 
 
 async def _drive(
-    ws, page_url: str, timeout: float, ua: str, mode: str = "stream"
+    ws,
+    page_url: str,
+    timeout: float,
+    ua: str,
+    mode: str = "stream",
+    parent_url: str | None = None,
 ) -> dict | None:
+    """Drive one solve attempt.
+
+    With ``parent_url`` the browser opens the page embedding the player and lets
+    the iframe load as a cross-site OOPIF (correct Referer and Sec-Fetch-Site);
+    navigating straight to ``page_url`` makes the player bounce to xstream.to.
+    """
     cdp = _CDP(ws)
     try:
         target = await cdp.send("Target.createTarget", {"url": "about:blank"})
@@ -529,12 +629,43 @@ async def _drive(
             {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
             sid,
         )
-        await cdp.send("Page.navigate", {"url": page_url}, sid)
+        iframe_host = _host_of(page_url) if parent_url else ""
+        child_sessions: dict[str, str] = {}
+
+        async def _enable_child(child_sid: str) -> None:
+            # Runtime.enable is a known CDP detection vector; evaluate works
+            # without it.
+            for domain in ("Network.enable", "Page.enable", "Log.enable"):
+                try:
+                    await cdp.send(domain, {}, child_sid)
+                except Exception as e:
+                    logger.debug("Turnstile solver: %s failed: %r", domain, e)
+            try:
+                await cdp.send(
+                    "Emulation.setFocusEmulationEnabled", {"enabled": True}, child_sid
+                )
+            except Exception as e:
+                logger.debug("Turnstile solver: focus emulation failed: %r", e)
+
+        if parent_url:
+            # The OOPIF is reported before it navigates: discovery lets us
+            # attach to the player iframe itself.
+            try:
+                await cdp.send("Target.setDiscoverTargets", {"discover": True})
+            except Exception as e:
+                logger.debug("Turnstile solver: setDiscoverTargets failed: %r", e)
+        await cdp.send("Page.navigate", {"url": parent_url or page_url}, sid)
 
         deadline = time.monotonic() + timeout
+        # No player iframe in the parent page (~10s): play it as a top document.
+        direct_nav_at = time.monotonic() + 10
+        direct_nav_done = False
+        player_seen = False
         iframe_sid = None
         clicks = 0
         next_probe = time.monotonic() + 3
+        # A live player may never POST /turnstile/: read its URL instead.
+        next_fallback = time.monotonic() + 9
         actual_ua = None
         server_date = None
         challenge_urls: dict[str, str] = {}
@@ -554,26 +685,49 @@ async def _drive(
                     url = params.get("request", {}).get("url", "")
                     if "challeng" in url or "turnstile" in url:
                         challenge_urls[params.get("requestId")] = url
-                elif method == "Target.attachedToTarget":
+                elif method in ("Target.attachedToTarget", "Target.targetCreated"):
                     info = params.get("targetInfo", {})
+                    tid = info.get("targetId") or ""
                     new_sid = params.get("sessionId")
-                    if not new_sid:
+                    if info.get("type") not in ("iframe", "page"):
                         continue
-                    if info.get("type") in ("iframe", "page"):
-                        iframe_sid = new_sid if info.get("type") == "iframe" else iframe_sid
-                        # Runtime.enable is a known CDP detection vector; evaluate
-                        # works without it.
-                        for domain in ("Network.enable", "Page.enable", "Log.enable"):
-                            try:
-                                await cdp.send(domain, {}, new_sid)
-                            except Exception as e:
-                                logger.debug("Turnstile solver: %s failed: %r", domain, e)
+                    if method == "Target.targetCreated":
+                        if not tid or tid in child_sessions:
+                            continue
+                        if not _is_player_target(info, iframe_host):
+                            continue
                         try:
-                            await cdp.send(
-                                "Emulation.setFocusEmulationEnabled", {"enabled": True}, new_sid
+                            attached_child = await cdp.send(
+                                "Target.attachToTarget",
+                                {"targetId": tid, "flatten": True},
                             )
                         except Exception as e:
-                            logger.debug("Turnstile solver: focus emulation failed: %r", e)
+                            logger.debug(
+                                "Turnstile solver: player target attach failed: %r", e
+                            )
+                            continue
+                        new_sid = attached_child.get("sessionId")
+                    if not new_sid:
+                        continue
+                    if tid:
+                        child_sessions[tid] = new_sid
+                    # The POST/JSON the gate releases arrives on this session.
+                    await _enable_child(new_sid)
+                    if info.get("type") == "iframe" and (
+                        not parent_url
+                        or iframe_sid is None
+                        or _is_player_target(info, iframe_host)
+                    ):
+                        iframe_sid = new_sid
+                    if _is_player_target(info, iframe_host):
+                        player_seen = True
+                elif method == "Target.targetInfoChanged":
+                    # The OOPIF often attaches before its URL is known.
+                    info = params.get("targetInfo", {})
+                    new_sid = child_sessions.get(info.get("targetId") or "")
+                    if new_sid and _is_player_target(info, iframe_host):
+                        iframe_sid = new_sid
+                        player_seen = True
                 elif method == "Network.responseReceived":
                     url = params.get("response", {}).get("url", "")
                     if esid == sid and server_date is None:
@@ -645,6 +799,20 @@ async def _drive(
                         entry.get("level"),
                         entry.get("text"),
                     )
+
+            if parent_url and not direct_nav_done and not player_seen:
+                if time.monotonic() >= direct_nav_at:
+                    direct_nav_done = True
+                    logger.info(
+                        "Turnstile solver: no player iframe in %s, navigating directly",
+                        parent_url,
+                    )
+                    try:
+                        await cdp.send("Page.navigate", {"url": page_url}, sid)
+                    except Exception as e:
+                        logger.debug(
+                            "Turnstile solver: direct navigation failed: %r", e
+                        )
 
             if iframe_sid and time.monotonic() >= next_probe:
                 next_probe = time.monotonic() + 3
@@ -734,6 +902,38 @@ async def _drive(
                         logger.info(
                             "Turnstile solver: clicked widget (%d/4)", clicks
                         )
+
+            if mode == "stream" and time.monotonic() >= next_fallback:
+                next_fallback = time.monotonic() + 2
+                # Ungated player: it starts on its own and the signed URL is
+                # already there, so no POST /turnstile/ will ever arrive. Probe
+                # the player session(s) first, then the top document.
+                candidates = [iframe_sid] + list(child_sessions.values()) + [sid]
+                for probe_sid in dict.fromkeys(s for s in candidates if s):
+                    try:
+                        res = await cdp.send(
+                            "Runtime.evaluate",
+                            {"expression": _READ_STREAM_URL, "returnByValue": True},
+                            probe_sid,
+                        )
+                    except Exception as e:
+                        if _is_stale_session(e) and probe_sid == iframe_sid:
+                            iframe_sid = None
+                        logger.debug(
+                            "Turnstile solver: stream URL probe failed: %r", e
+                        )
+                        continue
+                    hit = (res.get("result", {}) or {}).get("value")
+                    if isinstance(hit, str) and hit:
+                        logger.info(
+                            "Turnstile solver: stream URL read from player (fallback)"
+                        )
+                        return {
+                            "success": True,
+                            "stream_url": hit,
+                            "stream_url_nop2p": None,
+                            "_solver_user_agent": actual_ua or ua,
+                        }
 
         if mode == "premium" and captured.get("ticket"):
             # The ticket alone is enough for the caller's own token GET.
