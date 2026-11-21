@@ -181,8 +181,10 @@ class HLSProxyStreamingMixin:
 
     @staticmethod
     def _is_valid_ts(data: bytes) -> bool:
-        """Unwrapped payload is usable only with a TS sync byte."""
-        return bool(data) and len(data) > 188 and data[0] == 0x47
+        """Unwrapped payload is usable only with repeated TS sync bytes."""
+        if not data or len(data) <= 188 * 2:
+            return False
+        return data[0] == 0x47 and data[188] == 0x47 and data[376] == 0x47
 
     async def handle_ts_segment(self, request):
         """Gestisce richieste per segmenti .ts"""
@@ -953,7 +955,7 @@ class HLSProxyStreamingMixin:
             resp = await curl_s.get(
                 final_curl_request_url(stream_url),
                 headers=prepare_curl_headers(stream_url, headers),
-                proxies={"http": session_proxy, "https": session_proxy} if session_proxy else None,
+                proxies=_config.get_curl_proxy_map(session_proxy),
                 verify=not disable_ssl,
                 timeout=15,
                 stream=True,
@@ -1368,12 +1370,9 @@ class HLSProxyStreamingMixin:
                     curl_headers = prepare_curl_headers(stream_url, headers)
 
 
-                    curl_proxies = None
                     logger.debug(f"🚀 [curl_cffi] Sending headers for {stream_url[:50]}: {curl_headers}")
 
-                    curl_proxies = None
-                    if session_proxy:
-                        curl_proxies = {"http": session_proxy, "https": session_proxy}
+                    curl_proxies = _config.get_curl_proxy_map(session_proxy)
 
                     final_curl_url = final_curl_request_url(stream_url)
 
